@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.coverage
+htmlcov/
+tmp/
+.runtime/
+
+# 索引数据与状态快照只留本机，不入库（含受限笔记元数据）
+part-*.jsonl
+state/accepted-snapshot.json
