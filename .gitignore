@@ -10,6 +10,8 @@ tmp/
 # 索引数据与状态快照只留本机，不入库（含受限笔记元数据）
 part-*.jsonl
 state/
+apply-transaction.json
+apply-transaction-*/
 .get-index-apply-*.tmp
 .get-index-journal-*.tmp
 .get-index-recovery-*.tmp

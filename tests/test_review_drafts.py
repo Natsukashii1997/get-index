@@ -1153,12 +1153,14 @@ class ReviewDraftCliTests(unittest.TestCase):
                         alias_vault / "review-draft.json",
                         vault,
                         [],
+                        directory_identities={},
                     )
                 with self.assertRaises(incremental.ScanError):
                     incremental.resolved_output_path(
                         alias_protected,
                         vault,
                         [protected],
+                        directory_identities={},
                     )
 
     def test_snapshot_symlink_and_fifo_are_rejected_without_blocking(self) -> None:

@@ -708,7 +708,9 @@ class AtomicApplyCliTests(unittest.TestCase):
                     index_directory.rmdir()
                     preserved_index.rename(index_directory)
 
-    def test_interrupted_transaction_residuals_are_git_ignored(self) -> None:
+    def assert_interrupted_transaction_residuals_are_git_ignored(
+        self, snapshot_path: str,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir).resolve()
             subprocess.run(
@@ -716,10 +718,10 @@ class AtomicApplyCliTests(unittest.TestCase):
                 check=True, capture_output=True, timeout=5,
             )
             (root / ".gitignore").write_bytes((PROJECT_ROOT / ".gitignore").read_bytes())
-            state = root / "state"
+            snapshot = root / snapshot_path
+            state = snapshot.parent
             state.mkdir()
             record = root / "part-1.jsonl"
-            snapshot = state / "accepted-snapshot.json"
             old_metadata = b"SYNTHETIC-PRIVATE-OLD-METADATA\n"
             record.write_bytes(old_metadata)
             snapshot.write_bytes(b"SYNTHETIC-OLD-SNAPSHOT\n")
@@ -760,11 +762,22 @@ class AtomicApplyCliTests(unittest.TestCase):
             # Code and test files must remain visible to Git.
             visible = subprocess.run(
                 ["git", "-C", str(root), "check-ignore", "--no-index", "--stdin"],
-                input="get_index_transaction.py\ntests/test_atomic_apply.py\n",
+                input=("get_index_transaction.py\ntests/test_atomic_apply.py\n"
+                       "snapshots/helper.py\napply-transaction-helper.py\n"),
                 text=True, capture_output=True, check=False, timeout=5,
             )
             self.assertEqual(visible.returncode, 1, visible.stderr)
             self.assertEqual(visible.stdout, "")
+
+    def test_interrupted_transaction_residuals_are_git_ignored(self) -> None:
+        self.assert_interrupted_transaction_residuals_are_git_ignored(
+            "state/accepted-snapshot.json"
+        )
+
+    def test_nondefault_snapshot_transaction_residuals_are_git_ignored(self) -> None:
+        self.assert_interrupted_transaction_residuals_are_git_ignored(
+            "snapshots/part-accepted.jsonl"
+        )
 
     def test_interrupted_transaction_before_snapshot_is_exactly_rolled_back(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

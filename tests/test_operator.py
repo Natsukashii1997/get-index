@@ -165,6 +165,184 @@ class OperatorRendererTests(unittest.TestCase):
 
 
 class OperatorCliTests(unittest.TestCase):
+    def assert_packet_ancestor_race_rejected(
+        self, operation: str, timing: str, destination: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="packet-race-") as temp_dir:
+            root = Path(temp_dir).resolve()
+            vault, snapshot, records, pages, runtime = prepare_operator_case(root)
+            stable = next((vault / "GET NOTES").rglob("*.md"))
+            if operation == "keep_governance":
+                stable.write_text(stable.read_text().replace('title: "stable"',
+                                                            'title: "renamed"'))
+            else:
+                write_source(vault, "GET NOTES/Notes/2026-09-16/new.md",
+                             uid="uid-new", title="synthetic new")
+            config = operator.OperationConfig(vault, snapshot, tuple(records), runtime)
+            report = operator.scan_read_only(config)
+            bundle = operator.build_review_bundle(config, report)
+            packet_id = operator.packet_id_for(bundle)
+            target_parent = vault / "GET NOTES" / "packets" / packet_id
+            target_parent.mkdir(parents=True)
+            # Existing targets must not be overwritten; no new or temporary
+            # source-layer files may be created, even if later cleaned up.
+            for name in ("scan.json", "draft.json", "reviewed.json", "manifest.json"):
+                (target_parent / name).write_bytes(b"SYNTHETIC-SOURCE-KEEP\n")
+            packet = None
+            if operation in ("review", "keep_governance"):
+                packet = operator.create_or_load_packet(config, report)
+                # Reloaded packets need the same protection as newly made ones.
+                packet = operator.create_or_load_packet(config, report)
+            source_root = vault / "GET NOTES"
+            source_paths = sorted(source_root.rglob("*"))
+            protected = [p for p in source_paths if p.is_file()] + [snapshot, *records, *pages]
+            before = manifest(protected)
+            source_names = [p.relative_to(source_root) for p in source_paths]
+            moved = root / "runtime-before-swap"
+            swapped = False
+            source_creations = []
+            real_write = incremental.atomic_write_json
+            real_open = os.open
+            real_fsync = os.fsync
+            writing_target = False
+
+            def swap():
+                nonlocal swapped
+                runtime.rename(moved)
+                runtime.symlink_to(source_root if destination == "vault" else moved,
+                                   target_is_directory=True)
+                swapped = True
+
+            def write_with_race(path, payload, *args, **kwargs):
+                nonlocal writing_target
+                writing_target = path.name == (operation if operation.endswith(".json")
+                                               else "reviewed.json")
+                if writing_target and timing == "before_open":
+                    swap()
+                try:
+                    return real_write(path, payload, *args, **kwargs)
+                finally:
+                    writing_target = False
+
+            def fsync_with_race(fd):
+                real_fsync(fd)
+                if writing_target and timing == "before_replace" and not swapped:
+                    swap()
+
+            def track_open(path, flags, *args, **kwargs):
+                parent_fd = kwargs.get("dir_fd")
+                if flags & os.O_CREAT and parent_fd is not None:
+                    parent = os.fstat(parent_fd)
+                    target = target_parent.stat()
+                    if (parent.st_dev, parent.st_ino) == (target.st_dev, target.st_ino):
+                        source_creations.append(str(path))
+                return real_open(path, flags, *args, **kwargs)
+
+            answers = iter(["1"] if operation == "keep_governance" else
+                           ["2", "3", "1", "1", "1", "确认复核"])
+            rejected = False
+            reported_saved = False
+            with mock.patch.object(incremental, "atomic_write_json", side_effect=write_with_race), \
+                 mock.patch.object(os, "open", side_effect=track_open), \
+                 mock.patch.object(os, "fsync", side_effect=fsync_with_race), \
+                 mock.patch.object(operator, "prompt_user", side_effect=lambda _msg: next(answers)):
+                try:
+                    if packet is None:
+                        operator.create_or_load_packet(config, report)
+                    else:
+                        _, reported_saved = operator.review_interactively(packet)
+                except incremental.ScanError:
+                    rejected = True
+            self.assertTrue(swapped, "race injection did not run")
+            self.assertEqual(
+                {"rejected": rejected, "reported_saved": reported_saved,
+                 "source_unchanged": manifest(protected) == before,
+                 "source_creations": source_creations},
+                {"rejected": True, "reported_saved": False,
+                 "source_unchanged": True, "source_creations": []},
+            )
+            self.assertEqual([p.relative_to(source_root) for p in sorted(source_root.rglob("*"))],
+                             source_names)
+            self.assertFalse(list(root.rglob(".get-index-draft-*.tmp")))
+
+    def test_packet_directory_creation_ancestor_swap_preserves_get_sources(self) -> None:
+        for timing in ("after_runtime_validation", "before_mkdir"):
+            for destination in ("vault", "original_directory"):
+                with self.subTest(timing=timing, destination=destination):
+                    with tempfile.TemporaryDirectory(prefix="mkdir-race-") as temp_dir:
+                        root = Path(temp_dir).resolve()
+                        vault, snapshot, records, pages, _ = prepare_operator_case(root)
+                        write_source(vault, "GET NOTES/Notes/2026-09-16/new.md",
+                                     uid="uid-new", title="synthetic new")
+                        external = root / "external"
+                        external.mkdir()
+                        runtime = external / "runtime"
+                        moved = root / "external-before-swap"
+                        source_root = vault / "GET NOTES"
+                        runtime.mkdir(mode=0o700)
+                        (source_root / "runtime").mkdir(mode=0o700)
+                        protected = sorted(source_root.rglob("*.md")) + [snapshot, *records, *pages]
+                        before = manifest(protected)
+                        source_names = sorted(p.relative_to(source_root) for p in source_root.rglob("*"))
+                        config = operator.OperationConfig(vault, snapshot, tuple(records), runtime)
+                        report = operator.scan_read_only(config)
+                        real_canonical = operator.canonical_runtime_root
+                        real_mkdir = os.mkdir
+                        real_path_mkdir = Path.mkdir
+                        swapped = False
+
+                        def swap():
+                            nonlocal swapped
+                            external.rename(moved)
+                            external.symlink_to(source_root if destination == "vault" else moved,
+                                                target_is_directory=True)
+                            swapped = True
+
+                        def canonical_with_race(*args, **kwargs):
+                            result = real_canonical(*args, **kwargs)
+                            if timing == "after_runtime_validation":
+                                swap()
+                            return result
+
+                        def mkdir_with_race(path, *args, **kwargs):
+                            if timing == "before_mkdir" and not swapped:
+                                swap()
+                            return real_mkdir(path, *args, **kwargs)
+
+                        def path_mkdir_with_race(path, *args, **kwargs):
+                            if timing == "before_mkdir" and not swapped:
+                                swap()
+                            return real_path_mkdir(path, *args, **kwargs)
+
+                        rejected = False
+                        with mock.patch.object(operator, "canonical_runtime_root", side_effect=canonical_with_race), \
+                             mock.patch.object(os, "mkdir", side_effect=mkdir_with_race), \
+                             mock.patch.object(Path, "mkdir", new=path_mkdir_with_race):
+                            try:
+                                operator.create_or_load_packet(config, report)
+                            except incremental.ScanError:
+                                rejected = True
+                        self.assertTrue(swapped, "race injection did not run")
+                        self.assertEqual(
+                            {"rejected": rejected, "source_unchanged": manifest(protected) == before,
+                             "source_names": sorted(p.relative_to(source_root) for p in source_root.rglob("*"))},
+                            {"rejected": True, "source_unchanged": True, "source_names": source_names},
+                        )
+
+    def test_packet_creation_ancestor_swap_preserves_get_sources(self) -> None:
+        for name in ("scan.json", "draft.json", "reviewed.json", "manifest.json"):
+            for timing in ("before_open", "before_replace"):
+                for destination in ("vault", "original_directory"):
+                    with self.subTest(name=name, timing=timing, destination=destination):
+                        self.assert_packet_ancestor_race_rejected(name, timing, destination)
+
+    def test_review_save_ancestor_swap_preserves_get_sources(self) -> None:
+        for operation in ("review", "keep_governance"):
+            for timing in ("before_open", "before_replace"):
+                for destination in ("vault", "original_directory"):
+                    with self.subTest(operation=operation, timing=timing, destination=destination):
+                        self.assert_packet_ancestor_race_rejected(operation, timing, destination)
+
     def test_command_reports_four_lines_when_python3_is_missing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="无 Python ") as temp_dir:
             result = subprocess.run(

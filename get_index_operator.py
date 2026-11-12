@@ -210,7 +210,9 @@ def check_only(config: OperationConfig) -> dict[str, Any]:
     )
 
 
-def canonical_runtime_root(config: OperationConfig) -> Path:
+def canonical_runtime_root(
+    config: OperationConfig, directory_identities: dict[Path, tuple[int, int]],
+) -> Path:
     absolute = Path(os.path.abspath(config.runtime_root))
     probe = absolute
     missing_parts: list[str] = []
@@ -234,41 +236,52 @@ def canonical_runtime_root(config: OperationConfig) -> Path:
         raise incremental.ScanError("运行目录无法安全解析") from exc
     if canonical == vault_root or canonical.is_relative_to(vault_root):
         raise incremental.ScanError("运行目录必须位于 Vault 之外")
+    incremental.bind_output_directory(probe.resolve(strict=True), directory_identities)
     return canonical
 
 
-def secure_mkdir(path: Path) -> None:
+def secure_mkdir(path: Path, directory_identities: dict[Path, tuple[int, int]]) -> None:
+    incremental.verify_output_directories(directory_identities)
     missing: list[str] = []
     probe = path
-    while True:
-        try:
-            metadata = probe.lstat()
-            if stat_module.S_ISLNK(metadata.st_mode) or not stat_module.S_ISDIR(
-                metadata.st_mode
-            ):
-                raise incremental.ScanError("运行路径必须由真实目录组成")
-            break
-        except FileNotFoundError:
-            if probe.parent == probe:
-                raise incremental.ScanError("运行目录无法安全创建")
-            missing.append(probe.name)
-            probe = probe.parent
-        except OSError as exc:
-            raise incremental.ScanError("运行目录无法检查") from exc
-    for name in reversed(missing):
-        probe = probe / name
-        try:
-            probe.mkdir(mode=0o700)
-        except OSError as exc:
-            raise incremental.ScanError("运行目录无法安全创建") from exc
+    descriptor = -1
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        metadata = path.lstat()
+        while True:
+            try:
+                probe.lstat()
+                break
+            except FileNotFoundError:
+                if probe.parent == probe:
+                    raise incremental.ScanError("运行目录无法安全创建")
+                missing.append(probe.name)
+                probe = probe.parent
+        incremental.bind_output_directory(probe, directory_identities)
+        descriptor = os.open(probe, flags)
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != directory_identities[probe]:
+            raise incremental.ScanError("运行目录在打开期间发生变化")
+        incremental.verify_output_directories(directory_identities)
+        for name in reversed(missing):
+            # Creation is relative to the bound directory FD, so an ancestor
+            # redirect cannot create even an empty directory in GET sources.
+            os.mkdir(name, mode=0o700, dir_fd=descriptor)
+            child = os.open(name, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            probe = probe / name
+            opened = os.fstat(descriptor)
+            directory_identities[probe] = (opened.st_dev, opened.st_ino)
+            incremental.verify_output_directories(directory_identities)
+        incremental.verify_output_directories(directory_identities)
+        if os.fstat(descriptor).st_mode & 0o777 != 0o700:
+            os.fchmod(descriptor, 0o700)
     except OSError as exc:
-        raise incremental.ScanError("运行目录创建后无法检查") from exc
-    if stat_module.S_ISLNK(metadata.st_mode) or not stat_module.S_ISDIR(metadata.st_mode):
-        raise incremental.ScanError("运行目录必须是真实目录")
-    if metadata.st_mode & 0o777 != 0o700:
-        path.chmod(0o700)
+        raise incremental.ScanError("运行目录无法安全创建或检查") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def json_digest(payload: dict[str, Any]) -> str:
@@ -295,6 +308,7 @@ class ReviewPacket:
     draft: Path
     reviewed: Path
     created: bool
+    directory_identities: dict[Path, tuple[int, int]]
 
 
 def build_review_bundle(
@@ -325,7 +339,8 @@ def create_or_load_packet(
     config: OperationConfig,
     report: dict[str, Any],
 ) -> ReviewPacket:
-    runtime_root = canonical_runtime_root(config)
+    directory_identities: dict[Path, tuple[int, int]] = {}
+    runtime_root = canonical_runtime_root(config, directory_identities)
     bundle = build_review_bundle(config, report)
     packet_id = packet_id_for(bundle)
     packets_root = runtime_root / "packets"
@@ -333,9 +348,17 @@ def create_or_load_packet(
     draft = packet_directory / "draft.json"
     reviewed = packet_directory / "reviewed.json"
     manifest = packet_directory / "manifest.json"
-    secure_mkdir(runtime_root)
-    secure_mkdir(packets_root)
-    if packet_directory.exists():
+    secure_mkdir(runtime_root, directory_identities)
+    secure_mkdir(packets_root, directory_identities)
+    packet_exists = packet_directory.exists()
+    if not packet_exists:
+        secure_mkdir(packet_directory, directory_identities)
+    for output in (packet_directory / "scan.json", draft, reviewed, manifest):
+        incremental.resolved_output_path(
+            output, config.vault_root, [config.snapshot, *config.records],
+            directory_identities=directory_identities,
+        )
+    if packet_exists:
         metadata = packet_directory.lstat()
         if stat_module.S_ISLNK(metadata.st_mode) or not stat_module.S_ISDIR(
             metadata.st_mode
@@ -353,12 +376,20 @@ def create_or_load_packet(
         if stored_draft != bundle:
             raise incremental.ScanError("原始复核草稿已被改动")
         incremental.load_review_bundle(reviewed)
-        return ReviewPacket(packet_id, packet_directory, draft, reviewed, False)
+        return ReviewPacket(
+            packet_id, packet_directory, draft, reviewed, False, directory_identities
+        )
 
-    secure_mkdir(packet_directory)
-    incremental.atomic_write_json(packet_directory / "scan.json", report)
-    incremental.atomic_write_json(draft, bundle)
-    incremental.atomic_write_json(reviewed, bundle)
+    incremental.atomic_write_json(
+        packet_directory / "scan.json", report,
+        expected_directory_identities=directory_identities,
+    )
+    incremental.atomic_write_json(
+        draft, bundle, expected_directory_identities=directory_identities
+    )
+    incremental.atomic_write_json(
+        reviewed, bundle, expected_directory_identities=directory_identities
+    )
     incremental.atomic_write_json(
         manifest,
         {
@@ -366,8 +397,11 @@ def create_or_load_packet(
             "packet_id": packet_id,
             "draft_sha256": json_digest(bundle),
         },
+        expected_directory_identities=directory_identities,
     )
-    return ReviewPacket(packet_id, packet_directory, draft, reviewed, True)
+    return ReviewPacket(
+        packet_id, packet_directory, draft, reviewed, True, directory_identities
+    )
 
 
 def prompt_user(message: str) -> str:
@@ -444,7 +478,10 @@ def review_interactively(packet: ReviewPacket) -> tuple[dict[str, Any], bool]:
                     "已核验" if draft["basis"] == "summary" else "规则初分"
                 )
                 bundle = incremental.validate_review_bundle(bundle)
-                incremental.atomic_write_json(packet.reviewed, bundle)
+                incremental.atomic_write_json(
+                    packet.reviewed, bundle,
+                    expected_directory_identities=packet.directory_identities,
+                )
                 saved = True
                 continue
         domain = numbered_choice("领域", DOMAIN_CHOICES)
@@ -481,7 +518,10 @@ def review_interactively(packet: ReviewPacket) -> tuple[dict[str, Any], bool]:
             }
         )
         bundle = incremental.validate_review_bundle(bundle)
-        incremental.atomic_write_json(packet.reviewed, bundle)
+        incremental.atomic_write_json(
+            packet.reviewed, bundle,
+            expected_directory_identities=packet.directory_identities,
+        )
         saved = True
     return bundle, saved
 
