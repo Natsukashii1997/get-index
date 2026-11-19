@@ -834,6 +834,106 @@ class ReviewDraftCliTests(unittest.TestCase):
             self.assertFalse((vault / "review-draft.json").exists())
             self.assertEqual(list(vault.glob(".get-index-draft-*.tmp")), [])
 
+    def test_output_ancestor_swap_is_rejected_and_preserves_get_source(self) -> None:
+        for timing in ("after_validation", "before_replace"):
+            for destination in ("vault", "original_directory"):
+                with self.subTest(timing=timing, destination=destination):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        root = Path(temp_dir)
+                        vault = root / "vault"
+                        stable = write_source(
+                            vault,
+                            "GET NOTES/Notes/2026-09-15/stable.md",
+                            uid="uid-stable",
+                            title="stable",
+                        )
+                        snapshot = root / "accepted-snapshot.json"
+                        write_snapshot(
+                            snapshot,
+                            [snapshot_entry(stable, vault, uid="uid-stable", title="stable")],
+                        )
+                        records = root / "records.jsonl"
+                        write_records(
+                            records,
+                            [canonical_record(stable, vault, uid="uid-stable", title="stable")],
+                        )
+                        scan_report = root / "scan-report.json"
+                        scan_result = self.run_scan(vault, snapshot)
+                        self.assertEqual(scan_result.returncode, 0, scan_result.stderr)
+                        scan_report.write_text(
+                            scan_result.stdout,
+                            encoding="utf-8",
+                        )
+                        external = root / "external"
+                        output = external / "Notes/2026-09-15/stable.md"
+                        output.parent.mkdir(parents=True)
+                        output.write_bytes(b"KEEP-EXISTING-DRAFT\n")
+                        moved_external = root / "external-before-swap"
+                        protected = (stable, snapshot, records, scan_report)
+                        before = {
+                            path: (path.read_bytes(), path.stat().st_mtime_ns)
+                            for path in protected
+                        }
+                        args = argparse.Namespace(
+                            vault_root=vault,
+                            snapshot=snapshot,
+                            scan_report=scan_report,
+                            records=[records],
+                            output=output,
+                        )
+                        real_resolver = incremental.resolved_output_path
+                        real_fsync = os.fsync
+                        swapped = False
+
+                        def swap_ancestor() -> None:
+                            nonlocal swapped
+                            external.rename(moved_external)
+                            external.symlink_to(
+                                vault / "GET NOTES"
+                                if destination == "vault"
+                                else moved_external,
+                                target_is_directory=True,
+                            )
+                            swapped = True
+
+                        def resolve_then_swap(*args, **kwargs):
+                            resolved = real_resolver(*args, **kwargs)
+                            if timing == "after_validation":
+                                swap_ancestor()
+                            return resolved
+
+                        def fsync_then_swap(descriptor):
+                            real_fsync(descriptor)
+                            if timing == "before_replace" and not swapped:
+                                swap_ancestor()
+
+                        rejected = False
+                        with mock.patch.object(
+                            incremental, "resolved_output_path", side_effect=resolve_then_swap
+                        ), mock.patch.object(incremental.os, "fsync", side_effect=fsync_then_swap):
+                            try:
+                                incremental.generate_review_draft(args)
+                            except incremental.ScanError:
+                                rejected = True
+
+                        self.assertTrue(swapped)
+                        self.assertEqual(
+                            {
+                                "rejected": rejected,
+                                "GET_source_unchanged": stable.read_bytes() == before[stable][0],
+                            },
+                            {"rejected": True, "GET_source_unchanged": True},
+                        )
+                        self.assertEqual(
+                            {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in protected},
+                            before,
+                        )
+                        self.assertEqual(
+                            (moved_external / "Notes/2026-09-15/stable.md").read_bytes(),
+                            b"KEEP-EXISTING-DRAFT\n",
+                        )
+                        self.assertEqual(list(root.rglob(".get-index-draft-*.tmp")), [])
+
     def test_atomic_replace_failure_preserves_old_output_and_removes_temp_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1053,12 +1153,14 @@ class ReviewDraftCliTests(unittest.TestCase):
                         alias_vault / "review-draft.json",
                         vault,
                         [],
+                        directory_identities={},
                     )
                 with self.assertRaises(incremental.ScanError):
                     incremental.resolved_output_path(
                         alias_protected,
                         vault,
                         [protected],
+                        directory_identities={},
                     )
 
     def test_snapshot_symlink_and_fifo_are_rejected_without_blocking(self) -> None:

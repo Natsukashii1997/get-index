@@ -708,6 +708,77 @@ class AtomicApplyCliTests(unittest.TestCase):
                     index_directory.rmdir()
                     preserved_index.rename(index_directory)
 
+    def assert_interrupted_transaction_residuals_are_git_ignored(
+        self, snapshot_path: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            subprocess.run(
+                ["git", "init", "--quiet", str(root)],
+                check=True, capture_output=True, timeout=5,
+            )
+            (root / ".gitignore").write_bytes((PROJECT_ROOT / ".gitignore").read_bytes())
+            snapshot = root / snapshot_path
+            state = snapshot.parent
+            state.mkdir()
+            record = root / "part-1.jsonl"
+            old_metadata = b"SYNTHETIC-PRIVATE-OLD-METADATA\n"
+            record.write_bytes(old_metadata)
+            snapshot.write_bytes(b"SYNTHETIC-OLD-SNAPSHOT\n")
+            journal = state / "apply-transaction.json"
+
+            with self.assertRaises(SystemExit):
+                replace_files_transactionally(
+                    {record: b"SYNTHETIC-NEW-METADATA\n", snapshot: b"SYNTHETIC-NEW-SNAPSHOT\n"},
+                    commit_marker=snapshot,
+                    journal_path=journal,
+                    after_replace=lambda _path, index: (_ for _ in ()).throw(SystemExit())
+                    if index == 1 else None,
+                )
+
+            backups = list(state.glob("apply-transaction-*/old-*.bin"))
+            stages = list(root.rglob(".get-index-apply-*.tmp"))
+            self.assertTrue(backups)
+            self.assertTrue(stages)
+            self.assertIn(old_metadata, [path.read_bytes() for path in backups])
+            self.assertTrue(journal.exists())
+            # Journal publication and recovery can also stop with a temporary file.
+            other_temps = [
+                directory / f".get-index-{kind}-synthetic.tmp"
+                for directory in (root, state)
+                for kind in ("apply", "journal", "recovery")
+            ]
+            for path in other_temps:
+                path.write_bytes(b"SYNTHETIC-TRANSACTION-RESIDUE\n")
+            paths = [record, snapshot, journal, *backups, *stages, *other_temps]
+            relative_paths = [path.relative_to(root).as_posix() for path in paths]
+            ignored = subprocess.run(
+                ["git", "-C", str(root), "check-ignore", "--no-index", "--stdin"],
+                input="\n".join(relative_paths) + "\n",
+                text=True, capture_output=True, check=False, timeout=5,
+            )
+            self.assertIn(ignored.returncode, (0, 1), ignored.stderr)
+            self.assertEqual(set(relative_paths) - set(ignored.stdout.splitlines()), set())
+            # Code and test files must remain visible to Git.
+            visible = subprocess.run(
+                ["git", "-C", str(root), "check-ignore", "--no-index", "--stdin"],
+                input=("get_index_transaction.py\ntests/test_atomic_apply.py\n"
+                       "snapshots/helper.py\napply-transaction-helper.py\n"),
+                text=True, capture_output=True, check=False, timeout=5,
+            )
+            self.assertEqual(visible.returncode, 1, visible.stderr)
+            self.assertEqual(visible.stdout, "")
+
+    def test_interrupted_transaction_residuals_are_git_ignored(self) -> None:
+        self.assert_interrupted_transaction_residuals_are_git_ignored(
+            "state/accepted-snapshot.json"
+        )
+
+    def test_nondefault_snapshot_transaction_residuals_are_git_ignored(self) -> None:
+        self.assert_interrupted_transaction_residuals_are_git_ignored(
+            "snapshots/part-accepted.jsonl"
+        )
+
     def test_interrupted_transaction_before_snapshot_is_exactly_rolled_back(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

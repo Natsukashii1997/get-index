@@ -944,6 +944,8 @@ def resolved_output_path(
     output: Path,
     vault_root: Path,
     protected_paths: list[Path],
+    *,
+    directory_identities: dict[Path, tuple[int, int]],
 ) -> Path:
     try:
         output_stat = output.lstat()
@@ -988,17 +990,56 @@ def resolved_output_path(
             raise ScanError("待复核草稿输出不得替换已接受输入")
     if not resolved.parent.is_dir():
         raise ScanError("待复核草稿输出的父目录不存在")
+    bind_output_directory(resolved.parent, directory_identities)
     return resolved
+
+
+def bind_output_directory(
+    path: Path, directory_identities: dict[Path, tuple[int, int]],
+) -> None:
+    for directory in (path, *path.parents):
+        try:
+            directory_stat = directory.lstat()
+        except OSError as exc:
+            raise ScanError("无法检查待复核草稿输出的祖先目录") from exc
+        if not stat_module.S_ISDIR(directory_stat.st_mode):
+            raise ScanError("待复核草稿输出的祖先路径必须是真实目录")
+        identity = (directory_stat.st_dev, directory_stat.st_ino)
+        if (
+            directory in directory_identities
+            and directory_identities[directory] != identity
+        ):
+            raise ScanError("待复核草稿输出的祖先目录在校验后发生变化")
+        directory_identities[directory] = identity
+
+
+def verify_output_directories(directory_identities: dict[Path, tuple[int, int]]) -> None:
+    try:
+        for directory, identity in directory_identities.items():
+            visible = directory.lstat()
+            if not stat_module.S_ISDIR(visible.st_mode) or (
+                visible.st_dev, visible.st_ino
+            ) != identity:
+                raise ScanError("待复核草稿输出的祖先目录在校验后发生变化")
+    except OSError as exc:
+        raise ScanError("无法检查待复核草稿输出的祖先目录") from exc
 
 
 def atomic_write_json(
     path: Path,
     payload: dict[str, Any],
     before_replace: Callable[[], None] | None = None,
+    *,
+    expected_directory_identities: dict[Path, tuple[int, int]],
 ) -> None:
+    if not path.is_absolute() or not expected_directory_identities or any(
+        parent not in expected_directory_identities for parent in path.parents
+    ):
+        raise ScanError("待复核草稿输出缺少完整目录保护上下文")
     descriptor = -1
     directory_descriptor = -1
     temp_name: str | None = None
+
     try:
         directory_flags = os.O_RDONLY
         directory_flags |= getattr(os, "O_DIRECTORY", 0)
@@ -1008,6 +1049,11 @@ def atomic_write_json(
         directory_stat = os.fstat(directory_descriptor)
         if not stat_module.S_ISDIR(directory_stat.st_mode):
             raise ScanError("待复核草稿输出的父路径必须是目录")
+        if (directory_stat.st_dev, directory_stat.st_ino) != (
+            expected_directory_identities[path.parent]
+        ):
+            raise ScanError("待复核草稿输出的父目录与已校验目录不一致")
+        verify_output_directories(expected_directory_identities)
 
         visible_parent_stat = path.parent.lstat()
         if stat_module.S_ISLNK(visible_parent_stat.st_mode) or (
@@ -1043,6 +1089,7 @@ def atomic_write_json(
             os.fsync(handle.fileno())
         if before_replace is not None:
             before_replace()
+        verify_output_directories(expected_directory_identities)
         try:
             destination_stat = os.stat(
                 path.name,
@@ -1096,10 +1143,12 @@ def generate_review_draft(args: argparse.Namespace) -> dict[str, Any]:
     bundle = validate_review_bundle(
         build_review_bundle(accepted, current, report, records)
     )
+    directory_identities: dict[Path, tuple[int, int]] = {}
     output = resolved_output_path(
         args.output,
         args.vault_root,
         [args.snapshot, args.scan_report, *args.records],
+        directory_identities=directory_identities,
     )
 
     def ensure_sources_still_match() -> None:
@@ -1107,7 +1156,12 @@ def generate_review_draft(args: argparse.Namespace) -> dict[str, Any]:
         if source_fingerprint(final_current) != bundle["current_fingerprint"]:
             raise ScanError("生成待复核草稿期间 GET 来源发生变化")
 
-    atomic_write_json(output, bundle, before_replace=ensure_sources_still_match)
+    atomic_write_json(
+        output,
+        bundle,
+        before_replace=ensure_sources_still_match,
+        expected_directory_identities=directory_identities,
+    )
     return {
         "schema_version": 1,
         "status": bundle["status"],
