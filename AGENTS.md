@@ -29,3 +29,4 @@ This is a single-context project. See `docs/agents/domain.md` for how to consume
 2026-11-07 用「项目起步」补铺：交接写在 [CURRENT.md](CURRENT.md) 顶部，骨架照 [docs/templates/handoff.md](docs/templates/handoff.md)；坑记在 [docs/LESSONS.md](docs/LESSONS.md)；交接写法与验收见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。改动怎么走见 `/Users/nat/Documents/ChatGPT/个人/work/agent-kit/工程流程.md`。
 
 测试：`python3 -m unittest discover -s tests`（业务）；`node --test tests/*.test.mjs`（交接格式与通用规则）。
+钩子：`git config core.hooksPath scripts/hooks` 装提交、推送前的必经检查（每个克隆、每台电脑各一次；推送前跑 `node scripts/check-rules.mjs` 和 `node --test tests/*.test.mjs && python3 -B -m unittest discover -s tests`；不用 --no-verify 绕过）。
